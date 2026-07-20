@@ -521,7 +521,6 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 public final class LLMModelFactory: GenericModelFactory, TrainableModelContextLoader {
 
     public typealias ContextType = ModelContext
-    public typealias ContainerType = ModelContainerConstraint
 
     public init(
         typeRegistry: ModelTypeRegistry<TrainableLanguageModel>,
