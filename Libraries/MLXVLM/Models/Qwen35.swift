@@ -1092,11 +1092,11 @@ public class Qwen35: Module, VLMModel {
         let visionDType = visionModel.patchEmbed.proj.weight.dtype
         if let image {
             pixelParts.append(image.pixels.asType(visionDType))
-            suffixFrames.append(contentsOf: image.frames)
+            suffixFrames.append(contentsOf: image.frames ?? [])
         }
         if let video {
             pixelParts.append(video.pixels.asType(visionDType))
-            suffixFrames.append(contentsOf: video.frames)
+            suffixFrames.append(contentsOf: video.frames ?? [])
         }
         if !pixelParts.isEmpty {
             let textEmbeds = languageModel.model.embedTokens(suffixIds)
