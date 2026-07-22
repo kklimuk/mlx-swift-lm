@@ -14,6 +14,7 @@ import MLXNN
 
 private enum Qwen35VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
+    case suffixStartOutOfRange(start: Int, total: Int)
 }
 
 private let precomputedPositionIdsKey = LMOutput.Key<MLXArray>(
@@ -1040,6 +1041,93 @@ public class Qwen35: Module, VLMModel {
             )
         }
 
+        return .logits(output)
+    }
+
+    /// Prefill continuation: forward only the uncached suffix of a prompt whose earlier
+    /// tokens already sit in `cache`, with M-RoPE positions computed over the full sequence.
+    ///
+    /// `prepare(_:cache:windowSize:)` computes positions from offset 0 over exactly the
+    /// tokens it is handed, so a caller holding a warm cache must re-forward the whole prompt
+    /// to keep vision positions correct. This method separates the cheap part from the
+    /// expensive part the way vLLM's M-RoPE implementation does: `getRopeIndex` runs over
+    /// `fullTokens` (needs every image/video grid in sequence order — cached ones included,
+    /// because each grid's extent shifts every later position), while the language-model
+    /// forward covers only `fullTokens[suffixStart...]`.
+    ///
+    /// `image`/`video` carry pixels for ONLY the media whose pad tokens sit inside the
+    /// suffix — cached media contributions already live in `cache`, and the merge guard
+    /// throws if the supplied features do not exactly cover the suffix's pad tokens. The
+    /// returned output's state carries the rope deltas, so text-only continuation (chunked
+    /// prefill or decode) resumes on the standard delta path.
+    public func prepareSuffix(
+        fullTokens: MLXArray,
+        suffixStart: Int,
+        image: LMInput.ProcessedImage?,
+        video: LMInput.ProcessedVideo?,
+        allImageFrames: [THW]?,
+        allVideoFrames: [THW]?,
+        cache: [any KVCache]
+    ) throws -> PrepareResult {
+        let fullIds = fullTokens.ndim == 1 ? fullTokens.expandedDimensions(axis: 0) : fullTokens
+        let totalLength = fullIds.dim(-1)
+        guard suffixStart >= 0, suffixStart < totalLength else {
+            throw Qwen35VLError.suffixStartOutOfRange(start: suffixStart, total: totalLength)
+        }
+
+        let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: fullIds,
+            imageGridTHW: allImageFrames,
+            videoGridTHW: allVideoFrames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId)
+
+        let suffixIds = fullIds[0..., suffixStart...]
+
+        var inputEmbeddings: MLXArray?
+        var pixelParts: [MLXArray] = []
+        var suffixFrames: [THW] = []
+        let visionDType = visionModel.patchEmbed.proj.weight.dtype
+        if let image {
+            pixelParts.append(image.pixels.asType(visionDType))
+            suffixFrames.append(contentsOf: image.frames)
+        }
+        if let video {
+            pixelParts.append(video.pixels.asType(visionDType))
+            suffixFrames.append(contentsOf: video.frames)
+        }
+        if !pixelParts.isEmpty {
+            let textEmbeds = languageModel.model.embedTokens(suffixIds)
+            let (visionHidden, _) = visionModel(concatenated(pixelParts), gridTHW: suffixFrames)
+            let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                imageFeatures: visionHidden.asType(textEmbeds.dtype),
+                inputEmbeds: textEmbeds,
+                inputIds: suffixIds,
+                imageTokenIndex: config.imageTokenIndex,
+                videoTokenIndex: config.videoTokenIndex)
+            inputEmbeddings = mergedEmbeds
+        }
+
+        var seededState = LMOutput.State()
+        seededState[ropeDeltasKey] = ropeDeltas
+
+        let suffixPositions = positionIds[0..., 0..., suffixStart...]
+        let typedCache = castCache(cache)
+        let output = withPreparedCache(cache, lengths: [totalLength - suffixStart]) {
+            languageModel(
+                suffixIds,
+                inputsEmbeds: inputEmbeddings,
+                cache: typedCache,
+                state: seededState,
+                mask: nil,
+                positionIds: suffixPositions,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil
+            )
+        }
         return .logits(output)
     }
 
